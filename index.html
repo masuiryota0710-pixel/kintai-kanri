@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>勤怠管理システム</title>
+  <link rel="stylesheet" href="css/style.css" />
+  <!-- 請求書PDF出力用（オフライン時はブラウザの印刷→PDF保存にフォールバック） -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js" defer></script>
+  <!-- Supabase クライアント -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+</head>
+<body>
+  <!-- 起動中 -->
+  <section id="loading-view" class="login-wrap"><p class="muted">読み込み中…</p></section>
+
+  <!-- ログイン画面 -->
+  <section id="login-view" class="login-wrap" hidden>
+    <form id="login-form" class="login-card">
+      <h1>勤怠管理システム</h1>
+      <p class="muted">メールアドレスとパスワードでログイン</p>
+      <label>メールアドレス<input name="email" type="email" required autocomplete="username" /></label>
+      <label>パスワード<input name="password" type="password" required minlength="6" autocomplete="current-password" /></label>
+      <details id="invite-box" class="invite-box">
+        <summary>はじめての方（招待コードをお持ちの方）</summary>
+        <p class="muted small">管理者から届いた招待コードを入力し、招待されたメールアドレスと、これから使うパスワード（6文字以上）でログインすると登録されます。</p>
+        <label>招待コード<input name="code" autocomplete="off" placeholder="例：A1B2C3D4" style="text-transform:uppercase" /></label>
+      </details>
+      <p id="login-error" class="error" hidden></p>
+      <button class="btn primary block" type="submit">ログイン</button>
+    </form>
+  </section>
+
+  <!-- 設定がまだの場合 -->
+  <section id="setup-view" class="login-wrap" hidden>
+    <div class="login-card">
+      <h1>Supabase の設定が必要です</h1>
+      <p><code>js/config.js</code> に Supabase の URL と anon キーを設定してから、このページを再読み込みしてください。</p>
+      <p class="muted small">手順は README.md を参照してください。</p>
+    </div>
+  </section>
+
+  <!-- アプリ本体 -->
+  <div id="app-view" class="app" hidden>
+    <aside class="sidebar">
+      <div class="brand">勤怠管理</div>
+      <div id="role-label" class="role-label"></div>
+      <nav id="nav"></nav>
+      <div class="sidebar-foot">
+        <div id="me-name" class="me-name"></div>
+        <button id="logout-btn" class="btn ghost small block">ログアウト</button>
+      </div>
+    </aside>
+    <main id="main"></main>
+  </div>
+
+  <div id="modal-root"></div>
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="js/config.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
