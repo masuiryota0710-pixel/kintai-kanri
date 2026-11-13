@@ -48,24 +48,26 @@ const sb = CONFIGURED
 const mapUser = (r) => ({ id: r.id, name: r.name, email: r.email, role: r.role, hourlyRate: r.hourly_rate, leaveGranted: r.leave_granted, active: r.active, createdAt: r.created_at });
 const mapAtt = (r) => ({ id: r.id, userId: r.user_id, date: r.work_date, clockIn: r.clock_in, clockOut: r.clock_out, editedBy: r.edited_by });
 const mapShift = (r) => ({ id: r.id, userId: r.user_id, date: r.work_date, start: r.start_time.slice(0, 5), end: r.end_time.slice(0, 5), note: r.note, status: r.status, comment: r.comment, decidedBy: r.decided_by, decidedAt: r.decided_at, createdAt: r.created_at });
+const mapAttReq = (r) => ({ id: r.id, userId: r.user_id, date: r.work_date, clockIn: r.clock_in, clockOut: r.clock_out, reason: r.reason, status: r.status, comment: r.comment, decidedBy: r.decided_by, decidedAt: r.decided_at, createdAt: r.created_at });
 const mapInvite = (r) => ({ email: r.email, code: r.code, name: r.name, role: r.role, hourlyRate: r.hourly_rate, leaveGranted: r.leave_granted, createdAt: r.created_at, usedAt: r.used_at });
 const mapLeave = (r) => ({ id: r.id, userId: r.user_id, start: r.start_date, end: r.end_date, days: r.days, reason: r.reason, status: r.status, comment: r.comment, decidedBy: r.decided_by, decidedAt: r.decided_at, createdAt: r.created_at });
 
-const emptyDb = () => ({ settings: { companyName: '' }, users: [], attendance: [], shifts: [], leaves: [], invitations: [] });
+const emptyDb = () => ({ settings: { companyName: '' }, users: [], attendance: [], shifts: [], leaves: [], invitations: [], attReqs: [] });
 let db = emptyDb();
 let sessionUserId = null;
 
 /** Supabase から最新データを読み込む（RLS により社員は自分の勤怠のみ取得される） */
 async function refresh() {
-  const [p, a, s, l, st, inv] = await Promise.all([
+  const [p, a, s, l, st, inv, ar] = await Promise.all([
     sb.from('profiles').select('*').order('created_at'),
     sb.from('attendance').select('*'),
     sb.from('shifts').select('*'),
     sb.from('leaves').select('*'),
     sb.from('settings').select('*').eq('id', 1).maybeSingle(),
     sb.from('invitations').select('*').is('used_at', null).order('created_at'), // 管理者以外は RLS で 0 件
+    sb.from('attendance_requests').select('*'), // 社員は自分の分のみ
   ]);
-  const err = [p, a, s, l, st, inv].find((r) => r.error)?.error;
+  const err = [p, a, s, l, st, inv, ar].find((r) => r.error)?.error;
   if (err) { toast('データの読み込みに失敗しました：' + errMsg(err), true); return false; }
   db = {
     settings: { companyName: st.data?.company_name ?? '' },
@@ -74,6 +76,7 @@ async function refresh() {
     shifts: s.data.map(mapShift),
     leaves: l.data.map(mapLeave),
     invitations: inv.data.map(mapInvite),
+    attReqs: ar.data.map(mapAttReq),
   };
   return true;
 }
@@ -151,12 +154,21 @@ function scheduleRefresh() {
     else render();
   }, 300);
 }
-function subscribeRealtime() {
-  if (channel) return;
-  channel = sb.channel('kintai-changes');
-  ['profiles', 'attendance', 'shifts', 'leaves', 'settings', 'invitations'].forEach((table) =>
+let subscribing = false;
+async function subscribeRealtime() {
+  if (channel || subscribing) return;
+  subscribing = true;
+  // ログアウト→ログイン直後は Realtime がまだ前の（または未ログインの）トークンを持っていることがあり、
+  // そのまま購読すると RLS で全イベントが弾かれる。購読前に現在のトークンを明示的に渡す。
+  const { data } = await sb.auth.getSession();
+  if (!data.session) { subscribing = false; return; }
+  sb.realtime.setAuth(data.session.access_token);
+  // 解除中の古いチャンネルと名前が重ならないよう、毎回新しい名前にする
+  channel = sb.channel('kintai-changes-' + Date.now());
+  ['profiles', 'attendance', 'shifts', 'leaves', 'settings', 'invitations', 'attendance_requests'].forEach((table) =>
     channel.on('postgres_changes', { event: '*', schema: 'public', table }, scheduleRefresh));
   channel.subscribe();
+  subscribing = false;
 }
 function unsubscribeRealtime() {
   if (channel) sb.removeChannel(channel);
@@ -172,7 +184,7 @@ const todayRec = (userId) => db.attendance.find((a) => a.userId === userId && a.
 const leaveUsed = (userId) => db.leaves.filter((l) => l.userId === userId && l.status === 'approved').reduce((s, l) => s + l.days, 0);
 const leavePending = (userId) => db.leaves.filter((l) => l.userId === userId && l.status === 'pending').reduce((s, l) => s + l.days, 0);
 const leaveRemain = (u) => u.leaveGranted - leaveUsed(u.id);
-const pendingCount = () => db.shifts.filter((s) => s.status === 'pending').length + db.leaves.filter((l) => l.status === 'pending').length;
+const pendingCount = () => [db.shifts, db.leaves, db.attReqs].reduce((n, list) => n + list.filter((x) => x.status === 'pending').length, 0);
 const statusBadge = (s) => `<span class="badge ${s}">${{ pending: '申請中', approved: '承認', rejected: '却下' }[s]}</span>`;
 const roleBadge = (r) => `<span class="badge ${r}">${r === 'admin' ? '管理者' : '社員'}</span>`;
 
@@ -287,12 +299,14 @@ VIEWS.clock = (me, el) => {
     <div class="card">
       <h3>今月の勤怠</h3>
       <div class="table-wrap"><table>
-        <thead><tr><th>日付</th><th>出勤</th><th>退勤</th><th class="num">休憩</th><th class="num">実働</th><th>備考</th></tr></thead>
-        <tbody>${list.length ? list.map((r) => `<tr><td>${fmtDateJa(r.date)}</td><td>${hm(r.clockIn)}</td><td>${hm(r.clockOut)}</td>
+        <thead><tr><th>日付</th><th>出勤</th><th>退勤</th><th class="num">休憩</th><th class="num">実働</th><th>備考</th><th></th></tr></thead>
+        <tbody>${list.length ? list.map((r) => `<tr><td>${fmtDateJa(r.date)}</td><td>${hm(r.clockIn)}</td><td>${r.clockOut ? hm(r.clockOut) : (r.date < ymd(new Date()) ? '<span class="badge rejected">退勤なし</span>' : '—')}</td>
           <td class="num">${r.clockOut ? breakMin(grossMin(r)) + '分' : '—'}</td><td class="num">${r.clockOut ? fmtDur(workMin(r)) : '—'}</td>
-          <td class="muted small">${r.editedBy ? '管理者修正' : ''}</td></tr>`).join('') : '<tr><td colspan="6" class="empty">記録がありません</td></tr>'}</tbody>
+          <td class="muted small">${pendingFix(me.id, r.date) ? '<span class="badge pending">修正申請中</span>' : r.editedBy ? '修正済み' : ''}</td>
+          <td>${pendingFix(me.id, r.date) ? '' : `<button class="btn small" data-fix="${r.date}">修正を申請</button>`}</td></tr>`).join('') : '<tr><td colspan="7" class="empty">記録がありません</td></tr>'}</tbody>
       </table></div>
-    </div>`;
+    </div>
+    ${fixRequestHtml(me)}`;
 
   const tick = () => {
     const n = new Date();
@@ -313,7 +327,71 @@ VIEWS.clock = (me, el) => {
     e.target.disabled = true;
     mutate(sb.from('attendance').update({ clock_out: new Date().toISOString() }).eq('id', r.id), '退勤しました。お疲れさまでした');
   };
+  bindFixRequest(me, el);
 };
+
+/* ---------- 打刻修正申請（社員） ---------- */
+const pendingFix = (userId, date) => db.attReqs.find((q) => q.userId === userId && q.date === date && q.status === 'pending');
+
+function fixRequestHtml(me) {
+  const d = viewState.fixDraft ?? (viewState.fixDraft = { date: ymd(addDays(new Date(), -1)), in: '09:00', out: '18:00', reason: '' });
+  const mine = db.attReqs.filter((q) => q.userId === me.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 20);
+  const cur = db.attendance.find((a) => a.userId === me.id && a.date === d.date);
+  return `
+    <div class="card" id="fix-card">
+      <h3>打刻修正の申請</h3>
+      <p class="muted small" style="margin:0 0 12px">打刻を忘れた・押し間違えたときに、正しい時刻を申請してください。管理者が承認すると勤怠に反映されます。</p>
+      <form id="fix-form" class="form-grid">
+        <label>日付<input type="date" name="date" required max="${ymd(new Date())}" value="${d.date}" /></label>
+        <label>出勤<input type="time" name="in" required value="${d.in}" /></label>
+        <label>退勤<input type="time" name="out" required value="${d.out}" /></label>
+        <label style="grid-column: span 2">理由<input name="reason" required placeholder="例：退勤の打刻を忘れたため" value="${esc(d.reason)}" /></label>
+        <button class="btn primary">修正を申請</button>
+      </form>
+      <p class="muted small" style="margin:10px 0 0">現在の記録（${fmtDateJa(d.date)}）：${cur ? `${hm(cur.clockIn)} 〜 ${cur.clockOut ? hm(cur.clockOut) : '退勤なし'}` : '記録なし'}</p>
+      <h3 style="margin-top:18px">自分の修正申請</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>日付</th><th>申請した時刻</th><th>理由</th><th>状態</th><th>コメント</th><th></th></tr></thead>
+        <tbody>${mine.length ? mine.map((q) => `<tr><td>${fmtDateJa(q.date)}</td><td>${hm(q.clockIn)} 〜 ${hm(q.clockOut)}</td><td>${esc(q.reason)}</td>
+          <td>${statusBadge(q.status)}</td><td class="muted small">${esc(q.comment)}</td>
+          <td>${q.status === 'pending' ? `<button class="btn small ng" data-cancel-fix="${q.id}">取消</button>` : ''}</td></tr>`).join('')
+          : '<tr><td colspan="6" class="empty">申請はまだありません</td></tr>'}</tbody>
+      </table></div>
+    </div>`;
+}
+
+function bindFixRequest(me, el) {
+  const form = $('#fix-form', el);
+  const draft = viewState.fixDraft;
+  const sync = () => Object.assign(draft, { date: form.date.value, in: form.in.value, out: form.out.value, reason: form.reason.value });
+  ['in', 'out', 'reason'].forEach((n) => (form[n].oninput = sync));
+  form.date.onchange = () => { sync(); render(); }; // 現在の記録を表示し直す
+  // 勤怠の行の「修正を申請」→ フォームにその日の記録を入れてスクロール
+  $$('[data-fix]', el).forEach((b) => (b.onclick = () => {
+    const r = db.attendance.find((a) => a.userId === me.id && a.date === b.dataset.fix);
+    Object.assign(draft, { date: b.dataset.fix, in: r?.clockIn ? hm(r.clockIn) : '09:00', out: r?.clockOut ? hm(r.clockOut) : '18:00', reason: '' });
+    render();
+    $('#fix-card')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    $('#fix-form [name=reason]')?.focus();
+  }));
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    sync();
+    const { date, in: i, out: o, reason } = draft;
+    if (date > ymd(new Date())) return toast('未来の日付は申請できません', true);
+    if (o <= i) return toast('退勤は出勤より後の時刻にしてください', true);
+    if (date === ymd(new Date()) && new Date(at(date, o)) > new Date()) return toast('まだ来ていない時刻は申請できません', true);
+    if (!reason.trim()) return toast('理由を入力してください', true);
+    if (pendingFix(me.id, date)) return toast('その日はすでに修正を申請中です', true);
+    const ok = await mutate(sb.from('attendance_requests').insert({ user_id: me.id, work_date: date, clock_in: at(date, i), clock_out: at(date, o), reason: reason.trim() }),
+      '打刻の修正を申請しました');
+    if (ok) { draft.reason = ''; render(); }
+  };
+  $$('[data-cancel-fix]', el).forEach((b) => (b.onclick = () => {
+    if (!confirm('この修正申請を取り消しますか？')) return;
+    mutate(sb.from('attendance_requests').delete().eq('id', b.dataset.cancelFix), '取り消しました');
+  }));
+}
 
 /* =========================================================
  * 共通：みんなの申請カレンダー（シフト・有給 / 承認済み＋申請中）
@@ -726,24 +804,38 @@ VIEWS.logs = (me, el) => {
  * 管理者：申請の承認・却下
  * ========================================================= */
 VIEWS.approvals = (me, el) => {
-  const tab = viewState.approvalsTab;
+  const TABS = {
+    shift: { label: 'シフト申請', table: 'shifts', src: db.shifts, okMsg: '承認しました（シフト一覧に反映済み）' },
+    leave: { label: '有給申請', table: 'leaves', src: db.leaves, okMsg: '承認しました（シフト一覧に反映済み）' },
+    fix: { label: '打刻修正', table: 'attendance_requests', src: db.attReqs, okMsg: '承認しました（勤怠に反映済み）' },
+  };
+  const tab = TABS[viewState.approvalsTab] ? viewState.approvalsTab : 'shift';
   const isShift = tab === 'shift';
-  const src = isShift ? db.shifts : db.leaves;
-  const pending = src.filter((x) => x.status === 'pending').sort((a, b) => (a.date ?? a.start).localeCompare(b.date ?? b.start));
+  const { src } = TABS[tab];
+  const sortKey = (x) => x.date ?? x.start;
+  const pending = src.filter((x) => x.status === 'pending').sort((a, b) => sortKey(a).localeCompare(sortKey(b)));
   const done = src.filter((x) => x.status !== 'pending').sort((a, b) => (b.decidedAt ?? '').localeCompare(a.decidedAt ?? '')).slice(0, 30);
-  const sp = db.shifts.filter((s) => s.status === 'pending').length;
-  const lp = db.leaves.filter((l) => l.status === 'pending').length;
+  const countOf = (k) => TABS[k].src.filter((x) => x.status === 'pending').length;
 
-  const detail = (x) => isShift
+  // 打刻修正：現在の記録と申請内容を並べて表示
+  const curAtt = (x) => db.attendance.find((a) => a.userId === x.userId && a.date === x.date);
+  const fixDetail = (x) => {
+    const c = curAtt(x);
+    const now = c ? `${hm(c.clockIn)} 〜 ${c.clockOut ? hm(c.clockOut) : '退勤なし'}` : '記録なし';
+    return `<td>${fmtDateJa(x.date)}</td><td class="muted">${now}</td><td><strong>${hm(x.clockIn)} 〜 ${hm(x.clockOut)}</strong></td><td>${esc(x.reason)}</td>`;
+  };
+  const detail = (x) => tab === 'shift'
     ? `<td>${fmtDateJa(x.date)}</td><td>${x.start}〜${x.end}</td><td>${esc(x.note)}</td>`
-    : `<td>${fmtDateJa(x.start)}${x.end !== x.start ? ' 〜 ' + fmtDateJa(x.end) : ''}</td><td class="num">${x.days}日（残${leaveRemain(db.users.find((u) => u.id === x.userId) ?? { leaveGranted: 0, id: '' })}日）</td><td>${esc(x.reason)}</td>`;
-  const head = isShift ? '<th>日付</th><th>時間</th><th>メモ</th>' : '<th>期間</th><th class="num">日数</th><th>理由</th>';
+    : tab === 'leave'
+      ? `<td>${fmtDateJa(x.start)}${x.end !== x.start ? ' 〜 ' + fmtDateJa(x.end) : ''}</td><td class="num">${x.days}日（残${leaveRemain(db.users.find((u) => u.id === x.userId) ?? { leaveGranted: 0, id: '' })}日）</td><td>${esc(x.reason)}</td>`
+      : fixDetail(x);
+  const head = { shift: '<th>日付</th><th>時間</th><th>メモ</th>', leave: '<th>期間</th><th class="num">日数</th><th>理由</th>', fix: '<th>日付</th><th>現在の記録</th><th>修正後</th><th>理由</th>' }[tab];
+  const cols = tab === 'fix' ? 7 : 6;
 
   el.innerHTML = `
     <div class="page-head"><h2>申請の承認</h2></div>
     <div class="tabs">
-      <button data-tab="shift" class="${isShift ? 'active' : ''}">シフト申請${sp ? `（${sp}）` : ''}</button>
-      <button data-tab="leave" class="${!isShift ? 'active' : ''}">有給申請${lp ? `（${lp}）` : ''}</button>
+      ${Object.entries(TABS).map(([k, t]) => `<button data-tab="${k}" class="${k === tab ? 'active' : ''}">${t.label}${countOf(k) ? `（${countOf(k)}）` : ''}</button>`).join('')}
     </div>
     <div class="card">
       <h3>承認待ち</h3>
@@ -751,7 +843,7 @@ VIEWS.approvals = (me, el) => {
         <thead><tr><th>申請者</th>${head}<th>申請日時</th><th></th></tr></thead>
         <tbody>${pending.length ? pending.map((x) => `<tr><td>${esc(userName(x.userId))}</td>${detail(x)}<td class="muted small">${fmtDT(x.createdAt)}</td>
           <td><button class="btn small ok" data-approve="${x.id}">承認</button> <button class="btn small ng" data-reject="${x.id}">却下</button></td></tr>`).join('')
-          : `<tr><td colspan="6" class="empty">承認待ちの申請はありません</td></tr>`}</tbody>
+          : `<tr><td colspan="${cols}" class="empty">承認待ちの申請はありません</td></tr>`}</tbody>
       </table></div>
     </div>
     <div class="card">
@@ -760,7 +852,7 @@ VIEWS.approvals = (me, el) => {
         <thead><tr><th>申請者</th>${head}<th>結果</th><th>処理者</th><th>コメント</th></tr></thead>
         <tbody>${done.length ? done.map((x) => `<tr><td>${esc(userName(x.userId))}</td>${detail(x)}<td>${statusBadge(x.status)}</td>
           <td class="small">${esc(userName(x.decidedBy))} <span class="muted">${fmtDT(x.decidedAt)}</span></td><td class="muted small">${esc(x.comment)}</td></tr>`).join('')
-          : `<tr><td colspan="7" class="empty">まだありません</td></tr>`}</tbody>
+          : `<tr><td colspan="${cols + 1}" class="empty">まだありません</td></tr>`}</tbody>
       </table></div>
     </div>`;
 
@@ -769,12 +861,13 @@ VIEWS.approvals = (me, el) => {
   const decide = async (id, status, comment = '') => {
     const x = src.find((s) => s.id === id);
     if (!x || x.status !== 'pending') return null;
-    if (status === 'approved' && !isShift) {
+    if (status === 'approved' && tab === 'leave') {
       const u = db.users.find((u) => u.id === x.userId);
       if (u && x.days > leaveRemain(u)) { toast('残日数が不足しているため承認できません', true); return null; }
     }
-    await mutate(sb.from(isShift ? 'shifts' : 'leaves').update({ status, comment }).eq('id', id).eq('status', 'pending'),
-      status === 'approved' ? '承認しました（シフト一覧に反映済み）' : '却下しました');
+    // 打刻修正の承認時、勤怠への反映は DB のトリガーが同じトランザクション内で行う
+    await mutate(sb.from(TABS[tab].table).update({ status, comment }).eq('id', id).eq('status', 'pending'),
+      status === 'approved' ? TABS[tab].okMsg : '却下しました');
     return null;
   };
   $$('[data-approve]', el).forEach((b) => (b.onclick = () => { b.disabled = true; decide(b.dataset.approve, 'approved'); }));
