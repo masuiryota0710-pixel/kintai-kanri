@@ -60,6 +60,25 @@ create table if not exists public.leaves (
   check (end_date >= start_date)
 );
 
+-- 打刻修正申請（打刻忘れ・打刻ミスを社員が申請 → 管理者が承認すると勤怠に反映）
+create table if not exists public.attendance_requests (
+  id         uuid primary key default gen_random_uuid(),
+  user_id    uuid not null references public.profiles (id) on delete cascade,
+  work_date  date not null,
+  clock_in   timestamptz not null,
+  clock_out  timestamptz not null,
+  reason     text not null check (length(trim(reason)) > 0),
+  status     text not null default 'pending' check (status in ('pending', 'approved', 'rejected')),
+  comment    text not null default '',
+  decided_by uuid references public.profiles (id) on delete set null,
+  decided_at timestamptz,
+  created_at timestamptz not null default now(),
+  check (clock_out > clock_in)
+);
+-- 同じ日の申請中は1人1件まで
+create unique index if not exists attendance_requests_one_pending
+  on public.attendance_requests (user_id, work_date) where status = 'pending';
+
 create table if not exists public.settings (
   id           integer primary key default 1 check (id = 1),
   company_name text not null default '株式会社サンプル'
@@ -254,6 +273,52 @@ drop trigger if exists leaves_guard on public.leaves;
 create trigger leaves_guard before insert or update on public.leaves
   for each row execute function public.guard_request();
 
+-- ---------- 打刻修正申請 ----------
+-- 申請時のチェック：未来の日付は不可、時刻はその日のもの（日本時間）であること
+create or replace function public.guard_attendance_request()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if tg_op = 'INSERT' then
+    if new.work_date > (now() at time zone 'Asia/Tokyo')::date then
+      raise exception '未来の日付は申請できません';
+    end if;
+    if (new.clock_in at time zone 'Asia/Tokyo')::date <> new.work_date
+       or (new.clock_out at time zone 'Asia/Tokyo')::date <> new.work_date then
+      raise exception '出勤・退勤の時刻は申請日のものを指定してください';
+    end if;
+    if new.clock_out > now() then
+      raise exception 'まだ来ていない時刻は申請できません';
+    end if;
+  end if;
+  return new;
+end $$;
+
+drop trigger if exists attendance_requests_check on public.attendance_requests;
+create trigger attendance_requests_check before insert on public.attendance_requests
+  for each row execute function public.guard_attendance_request();
+
+-- 申請中で作成・処理者の記録は共通ガードを使う
+drop trigger if exists attendance_requests_guard on public.attendance_requests;
+create trigger attendance_requests_guard before insert or update on public.attendance_requests
+  for each row execute function public.guard_request();
+
+-- 承認されたら勤怠に反映（記録が無い日は新規作成、ある日は上書き）
+create or replace function public.apply_attendance_request()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.status = 'approved' and old.status = 'pending' then
+    insert into public.attendance (user_id, work_date, clock_in, clock_out, edited_by)
+    values (new.user_id, new.work_date, new.clock_in, new.clock_out, new.decided_by)
+    on conflict (user_id, work_date) do update
+      set clock_in = excluded.clock_in, clock_out = excluded.clock_out, edited_by = excluded.edited_by;
+  end if;
+  return new;
+end $$;
+
+drop trigger if exists attendance_requests_apply on public.attendance_requests;
+create trigger attendance_requests_apply after update on public.attendance_requests
+  for each row execute function public.apply_attendance_request();
+
 -- ---------- RLS（行レベルセキュリティ） ----------
 alter table public.profiles   enable row level security;
 alter table public.attendance enable row level security;
@@ -261,6 +326,7 @@ alter table public.shifts     enable row level security;
 alter table public.leaves     enable row level security;
 alter table public.settings   enable row level security;
 alter table public.invitations enable row level security;
+alter table public.attendance_requests enable row level security;
 
 -- ※ 無効化されたユーザーは、ログインできても（API を直接叩いても）何も読み書きできない。
 --   そのため全ポリシーに is_active_user() / is_admin()（＝有効な管理者）の条件を付けている。
@@ -314,6 +380,19 @@ drop policy if exists leaves_delete on public.leaves;
 create policy leaves_delete on public.leaves for delete to authenticated
   using ((user_id = auth.uid() and status = 'pending' and public.is_active_user()) or public.is_admin());
 
+-- attendance_requests：自分の申請だけ見える（管理者は全員分）。申請は本人、承認・却下は管理者、取消は本人の申請中のみ。
+drop policy if exists attendance_requests_select on public.attendance_requests;
+create policy attendance_requests_select on public.attendance_requests for select to authenticated
+  using ((user_id = auth.uid() and public.is_active_user()) or public.is_admin());
+drop policy if exists attendance_requests_insert on public.attendance_requests;
+create policy attendance_requests_insert on public.attendance_requests for insert to authenticated
+  with check (user_id = auth.uid() and public.is_active_user());
+drop policy if exists attendance_requests_update on public.attendance_requests;
+create policy attendance_requests_update on public.attendance_requests for update to authenticated using (public.is_admin());
+drop policy if exists attendance_requests_delete on public.attendance_requests;
+create policy attendance_requests_delete on public.attendance_requests for delete to authenticated
+  using ((user_id = auth.uid() and status = 'pending' and public.is_active_user()) or public.is_admin());
+
 -- settings：有効なユーザーは読める、管理者だけ更新。
 drop policy if exists settings_select on public.settings;
 create policy settings_select on public.settings for select to authenticated using (public.is_active_user());
@@ -324,7 +403,7 @@ create policy settings_update on public.settings for update to authenticated usi
 do $$
 declare t text;
 begin
-  foreach t in array array['profiles', 'attendance', 'shifts', 'leaves', 'settings', 'invitations'] loop
+  foreach t in array array['profiles', 'attendance', 'shifts', 'leaves', 'settings', 'invitations', 'attendance_requests'] loop
     if not exists (
       select 1 from pg_publication_tables
       where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = t
